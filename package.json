@@ -1,0 +1,13 @@
+{
+  "name": "sts2-token-efficient-controller",
+  "version": "1.0.0",
+  "description": "Token-efficient, zero-screenshot AI controller and co-op assistant for Slay the Spire 2 (powered by STS2AIAgent HTTP bridge)",
+  "type": "module",
+  "main": "sts2.js",
+  "scripts": {
+    "test": "node --test test/*.test.js"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}
