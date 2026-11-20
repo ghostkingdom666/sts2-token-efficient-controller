@@ -3,9 +3,23 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { discoverInstances, detectSessionContext, Sts2Client } from '../src/api_client.js';
+import {
+  discoverInstances,
+  detectSessionContext,
+  isTransientReadinessBlock,
+  Sts2Client,
+} from '../src/api_client.js';
 import { compressState, computeCombatSummary, SeenCache } from '../src/compressor.js';
-import { bindHandCardCids, detectCombatDivergence, executeBatch, parseActionSequence } from '../src/batch_runner.js';
+import {
+  bindHandCardCids,
+  bindStepTargets,
+  detectCombatDivergence,
+  executeBatch,
+  isSafeRetargetEnemy,
+  matchEnemiesAcrossStates,
+  parseActionSequence,
+  pickSafeRetarget,
+} from '../src/batch_runner.js';
 import { lookupKeyword } from '../src/lookup.js';
 
 function makeTmpDir() {
@@ -468,4 +482,741 @@ test('lookupKeyword returns base and upgraded card descriptions from /data/cards
   const text = await lookupKeyword(client, '痛击', { type: 'cards', cacheDir: tmpDir });
   assert.match(text, /\[卡:BASH\] 痛击/);
   assert.match(text, /升级后\(2费\): 造成 10 点伤害。给予 3 层易伤/);
+});
+
+test('Opt 1a: executeBatch waits on step 0 transient snapshot_stabilizing before executing queue', async () => {
+  const tmpDir = makeTmpDir();
+  const seen = new SeenCache(path.join(tmpDir, 'seen.json'));
+
+  let snapCount = 0;
+  let hand = [
+    {
+      i: 0,
+      cid: 103,
+      type: 'attack',
+      card_id: 'STRIKE_IRONCLAD',
+      line: '打击 [1费]：造成 6 点伤害。',
+      energy_cost: 1,
+      playable: true,
+      targets: [0],
+      vs: [{ enemy: 0, damage: 6, kills: false }],
+    },
+  ];
+  let endTurnDone = false;
+  const postLog = [];
+
+  const mockFetch = async (url, init) => {
+    const parsedUrl = new URL(url);
+    if (parsedUrl.pathname === '/decision-snapshot') {
+      snapCount += 1;
+      const state = buildCombatStateFixture({ multiplayer: true, hand });
+      if (snapCount === 1) {
+        state.combat.action_readiness = {
+          can_use_combat_actions: false,
+          actions_settled: false,
+          reason: 'snapshot_stabilizing',
+        };
+      } else if (endTurnDone) {
+        state.combat.action_readiness = {
+          can_use_combat_actions: false,
+          local_ready_to_end_turn: true,
+          all_players_ready_to_end_turn: false,
+        };
+      }
+      return new Response(JSON.stringify({ ok: true, data: { state, available_actions: state.available_actions } }), { status: 200 });
+    }
+    if (parsedUrl.pathname === '/action' && init.method === 'POST') {
+      const body = JSON.parse(init.body);
+      postLog.push(body);
+      if (body.action === 'play_card') hand = [];
+      if (body.action === 'end_turn') endTurnDone = true;
+      const nextState = buildCombatStateFixture({ multiplayer: true, hand });
+      if (endTurnDone) {
+        nextState.combat.action_readiness = {
+          can_use_combat_actions: false,
+          local_ready_to_end_turn: true,
+          all_players_ready_to_end_turn: false,
+        };
+      }
+      return new Response(JSON.stringify({ ok: true, data: { action: body.action, status: 'completed', state: nextState } }), { status: 200 });
+    }
+    return new Response('{}', { status: 404 });
+  };
+
+  assert.equal(isTransientReadinessBlock({
+    screen: 'COMBAT',
+    combat: { action_readiness: { can_use_combat_actions: false, reason: 'snapshot_stabilizing' } },
+  }), true);
+  assert.equal(isTransientReadinessBlock({
+    screen: 'COMBAT',
+    combat: { action_readiness: { can_use_combat_actions: false, modal_open: true, reason: 'snapshot_stabilizing' } },
+  }), false);
+
+  const client = new Sts2Client({ baseUrl: 'http://127.0.0.1:8080', fetchFn: mockFetch });
+  const res = await executeBatch(client, 'play 0 0; end', { mode: 'coop', seenCache: seen, pollIntervalMs: 10 });
+  assert.equal(res.executed.length, 2);
+  assert.equal(res.stopReason, 'completed');
+  assert.equal(postLog.length, 2);
+  assert.equal(postLog[0].card_cid, 103);
+  assert.equal(snapCount >= 2, true);
+});
+
+test('Opt 1b: executeBatch retries transient POST invalid_action while settling, and never replays already-consumed cards', async () => {
+  const tmpDir = makeTmpDir();
+  const seen = new SeenCache(path.join(tmpDir, 'seen.json'));
+
+  // Part A: POST fails with invalid_action because teammate animation started stabilizing window; retries and succeeds
+  let handA = [
+    {
+      i: 0,
+      cid: 301,
+      type: 'attack',
+      card_id: 'STRIKE_IRONCLAD',
+      line: '打击 [1费]：造成 6 点伤害。',
+      energy_cost: 1,
+      playable: true,
+      targets: [0],
+      vs: [{ enemy: 0, damage: 6, kills: false }],
+    },
+    {
+      i: 1,
+      cid: 302,
+      type: 'skill',
+      card_id: 'DEFEND_IRONCLAD',
+      line: '防御 [1费]：获得 5 点 格挡 。',
+      energy_cost: 1,
+      playable: true,
+      targets: [],
+    },
+  ];
+  let postCountA = 0;
+  let probeAfterReject = false;
+
+  const mockFetchA = async (url, init) => {
+    const parsedUrl = new URL(url);
+    if (parsedUrl.pathname === '/decision-snapshot') {
+      const state = buildCombatStateFixture({ multiplayer: true, hand: handA });
+      if (probeAfterReject) {
+        probeAfterReject = false;
+        state.combat.action_readiness = {
+          can_use_combat_actions: false,
+          actions_settled: false,
+          reason: 'snapshot_stabilizing',
+        };
+      }
+      return new Response(JSON.stringify({ ok: true, data: { state, available_actions: state.available_actions } }), { status: 200 });
+    }
+    if (parsedUrl.pathname === '/action' && init.method === 'POST') {
+      postCountA += 1;
+      const body = JSON.parse(init.body);
+      if (postCountA === 1) {
+        probeAfterReject = true;
+        return new Response(JSON.stringify({
+          ok: false,
+          error: { code: 'invalid_action', message: 'combat actions temporarily stabilizing' },
+        }), { status: 400 });
+      }
+      if (body.card_cid === 301) handA = handA.filter((c) => c.cid !== 301);
+      if (body.card_cid === 302) handA = handA.filter((c) => c.cid !== 302);
+      const nextState = buildCombatStateFixture({ multiplayer: true, hand: handA });
+      return new Response(JSON.stringify({ ok: true, data: { action: body.action, status: 'completed', state: nextState } }), { status: 200 });
+    }
+    return new Response('{}', { status: 404 });
+  };
+
+  const clientA = new Sts2Client({ baseUrl: 'http://127.0.0.1:8080', fetchFn: mockFetchA });
+  const resA = await executeBatch(clientA, 'play 0 0; play 1', { mode: 'coop', seenCache: seen, pollIntervalMs: 10 });
+  assert.equal(resA.executed.length, 2);
+  assert.equal(resA.stopReason, 'completed');
+  assert.equal(postCountA, 3);
+
+  // Part B: If card cid is already consumed from hand when invalid_action returns, NEVER retry / double-play
+  let handB = [
+    {
+      i: 0,
+      cid: 401,
+      type: 'attack',
+      card_id: 'STRIKE_IRONCLAD',
+      line: '打击 [1费]：造成 6 点伤害。',
+      energy_cost: 1,
+      playable: true,
+      targets: [0],
+      vs: [{ enemy: 0, damage: 6, kills: false }],
+    },
+  ];
+  let postCountB = 0;
+
+  const mockFetchB = async (url, init) => {
+    const parsedUrl = new URL(url);
+    if (parsedUrl.pathname === '/decision-snapshot') {
+      const state = buildCombatStateFixture({ multiplayer: true, hand: handB });
+      return new Response(JSON.stringify({ ok: true, data: { state, available_actions: state.available_actions } }), { status: 200 });
+    }
+    if (parsedUrl.pathname === '/action' && init.method === 'POST') {
+      postCountB += 1;
+      handB = []; // Card was already played on server before invalid_action reported
+      return new Response(JSON.stringify({
+        ok: false,
+        error: { code: 'invalid_action', message: 'card_cid 401 not found in hand' },
+      }), { status: 400 });
+    }
+    return new Response('{}', { status: 404 });
+  };
+
+  const clientB = new Sts2Client({ baseUrl: 'http://127.0.0.1:8080', fetchFn: mockFetchB });
+  const resB = await executeBatch(clientB, 'play 0 0', { mode: 'coop', seenCache: seen, pollIntervalMs: 10 });
+  assert.equal(postCountB, 1);
+  assert.equal(resB.executed.length, 0);
+  assert.equal(resB.stopReason, 'invalid_action');
+});
+
+test('Opt 2: order-preserving enemy matching remaps shifted indices after teammate kill instead of aborting', async () => {
+  const tmpDir = makeTmpDir();
+  const seen = new SeenCache(path.join(tmpDir, 'seen.json'));
+
+  const makeEnemies = (teammateKilledFirst) => (
+    teammateKilledFirst
+      ? [
+          {
+            i: 0,
+            enemy_id: 'CULTIST',
+            name: '邪教徒',
+            hp: '48/50',
+            block: 0,
+            intent: 'PECK_MOVE',
+            move_id: 'PECK_MOVE',
+            powers: [],
+            intents: [{ i: 0, intent_type: 'Attack', damage: 6, hits: 1, total_damage: 6 }],
+            alive: true,
+            hittable: true,
+          },
+          {
+            i: 1,
+            enemy_id: 'JAW_WORM',
+            name: '颚虫',
+            hp: '40/44',
+            block: 0,
+            intent: 'CHOMP',
+            move_id: 'CHOMP',
+            powers: [],
+            intents: [{ i: 0, intent_type: 'Attack', damage: 11, hits: 1, total_damage: 11 }],
+            alive: true,
+            hittable: true,
+          },
+        ]
+      : [
+          {
+            i: 0,
+            enemy_id: 'SLIME_S',
+            name: '酸液史莱姆(小)',
+            hp: '8/12',
+            block: 0,
+            intent: 'TACKLE',
+            move_id: 'TACKLE',
+            powers: [],
+            intents: [{ i: 0, intent_type: 'Attack', damage: 3, hits: 1, total_damage: 3 }],
+            alive: true,
+            hittable: true,
+          },
+          {
+            i: 1,
+            enemy_id: 'CULTIST',
+            name: '邪教徒',
+            hp: '48/50',
+            block: 0,
+            intent: 'PECK_MOVE',
+            move_id: 'PECK_MOVE',
+            powers: [],
+            intents: [{ i: 0, intent_type: 'Attack', damage: 6, hits: 1, total_damage: 6 }],
+            alive: true,
+            hittable: true,
+          },
+          {
+            i: 2,
+            enemy_id: 'JAW_WORM',
+            name: '颚虫',
+            hp: '40/44',
+            block: 0,
+            intent: 'CHOMP',
+            move_id: 'CHOMP',
+            powers: [],
+            intents: [{ i: 0, intent_type: 'Attack', damage: 11, hits: 1, total_damage: 11 }],
+            alive: true,
+            hittable: true,
+          },
+        ]
+  );
+
+  // Verify direct matcher mapping first
+  const matchRes = matchEnemiesAcrossStates(
+    makeEnemies(false).map((e) => ({ idx: e.i, enemy_id: e.enemy_id })),
+    makeEnemies(true).map((e) => ({ idx: e.i, enemy_id: e.enemy_id })),
+  );
+  assert.equal(matchRes.spawned.length, 0);
+  assert.equal(matchRes.planIdxToCur.get(1)?.idx, 0);
+  assert.equal(matchRes.planIdxToCur.get(2)?.idx, 1);
+
+  let teammateKilledFirst = false;
+  let hand = [
+    {
+      i: 0,
+      cid: 501,
+      type: 'skill',
+      card_id: 'DEFEND_IRONCLAD',
+      line: '防御 [1费]：获得 5 点 格挡 。',
+      energy_cost: 1,
+      playable: true,
+      targets: [],
+    },
+    {
+      i: 1,
+      cid: 502,
+      type: 'attack',
+      card_id: 'STRIKE_IRONCLAD',
+      line: '打击 [1费]：造成 6 点伤害。',
+      energy_cost: 1,
+      playable: true,
+      targets: [0, 1, 2],
+      vs: [
+        { enemy: 0, damage: 6, kills: false },
+        { enemy: 1, damage: 6, kills: false },
+        { enemy: 2, damage: 6, kills: false },
+      ],
+    },
+  ];
+  const postLog = [];
+
+  const mockFetch = async (url, init) => {
+    const parsedUrl = new URL(url);
+    if (parsedUrl.pathname === '/decision-snapshot') {
+      const state = buildCombatStateFixture({
+        multiplayer: true,
+        hand: hand.map((c) => (c.targets.length > 0 ? { ...c, targets: teammateKilledFirst ? [0, 1] : [0, 1, 2] } : c)),
+        enemies: makeEnemies(teammateKilledFirst),
+      });
+      return new Response(JSON.stringify({ ok: true, data: { state, available_actions: state.available_actions } }), { status: 200 });
+    }
+    if (parsedUrl.pathname === '/action' && init.method === 'POST') {
+      const body = JSON.parse(init.body);
+      postLog.push(body);
+      if (body.card_cid === 501) {
+        hand = hand.filter((c) => c.cid !== 501).map((c, idx) => ({ ...c, i: idx }));
+        // Teammate kills [0] SLIME_S immediately while we played Defend -> CULTIST shifts [1] -> [0]!
+        teammateKilledFirst = true;
+      } else if (body.card_cid === 502) {
+        hand = [];
+      }
+      const nextState = buildCombatStateFixture({
+        multiplayer: true,
+        hand: hand.map((c) => (c.targets.length > 0 ? { ...c, targets: teammateKilledFirst ? [0, 1] : [0, 1, 2] } : c)),
+        enemies: makeEnemies(teammateKilledFirst),
+      });
+      return new Response(JSON.stringify({ ok: true, data: { action: body.action, status: 'completed', state: nextState } }), { status: 200 });
+    }
+    return new Response('{}', { status: 404 });
+  };
+
+  const client = new Sts2Client({ baseUrl: 'http://127.0.0.1:8080', fetchFn: mockFetch });
+  // Queue: Defend, Strike original target [1] CULTIST, end turn
+  const res = await executeBatch(client, 'play 0; play 1 1; end', { mode: 'coop', seenCache: seen, pollIntervalMs: 10 });
+  assert.equal(res.stopReason, 'completed');
+  assert.equal(res.executed.length, 3);
+  assert.equal(postLog[1].action, 'play_card');
+  assert.equal(postLog[1].card_cid, 502);
+  assert.equal(postLog[1].target_index, 0); // Remapped [1] -> [0]!
+  assert.equal(postLog[2].action, 'end_turn');
+});
+
+test('Opt 3a: default retarget="safe" auto-retargets onto safe normal enemy when target dies to teammate', async () => {
+  const tmpDir = makeTmpDir();
+  const seen = new SeenCache(path.join(tmpDir, 'seen.json'));
+
+  const enemiesStart = [
+    {
+      i: 0,
+      enemy_id: 'SLIME_S',
+      name: '酸液史莱姆(小)',
+      hp: '8/12',
+      block: 0,
+      intent: 'TACKLE',
+      move_id: 'TACKLE',
+      powers: [],
+      intents: [{ i: 0, intent_type: 'Attack', damage: 3, hits: 1, total_damage: 3 }],
+      alive: true,
+      hittable: true,
+    },
+    {
+      i: 1,
+      enemy_id: 'CULTIST',
+      name: '邪教徒',
+      hp: '35/50',
+      block: 0,
+      intent: 'PECK_MOVE',
+      move_id: 'PECK_MOVE',
+      powers: ['STRENGTH 1: 攻击增加 1。'],
+      intents: [{ i: 0, intent_type: 'Attack', damage: 7, hits: 1, total_damage: 7 }],
+      alive: true,
+      hittable: true,
+    },
+  ];
+  const enemiesAfterKill = [
+    {
+      ...enemiesStart[1],
+      i: 0,
+    },
+  ];
+
+  let targetKilled = false;
+  let hand = [
+    {
+      i: 0,
+      cid: 601,
+      type: 'skill',
+      card_id: 'DEFEND_IRONCLAD',
+      line: '防御 [1费]：获得 5 点 格挡 。',
+      energy_cost: 1,
+      playable: true,
+      targets: [],
+    },
+    {
+      i: 1,
+      cid: 602,
+      type: 'attack',
+      card_id: 'STRIKE_IRONCLAD',
+      line: '打击 [1费]：造成 6 点伤害。',
+      energy_cost: 1,
+      playable: true,
+      targets: [0, 1],
+      vs: [
+        { enemy: 0, damage: 6, kills: false },
+        { enemy: 1, damage: 6, kills: false },
+      ],
+    },
+  ];
+  const postLog = [];
+
+  const mockFetch = async (url, init) => {
+    const parsedUrl = new URL(url);
+    if (parsedUrl.pathname === '/decision-snapshot') {
+      const state = buildCombatStateFixture({
+        multiplayer: true,
+        hand: hand.map((c) => (c.targets.length > 0 ? {
+          ...c,
+          targets: targetKilled ? [0] : [0, 1],
+          vs: targetKilled ? [{ enemy: 0, damage: 6, kills: false }] : c.vs,
+        } : c)),
+        enemies: targetKilled ? enemiesAfterKill : enemiesStart,
+      });
+      return new Response(JSON.stringify({ ok: true, data: { state, available_actions: state.available_actions } }), { status: 200 });
+    }
+    if (parsedUrl.pathname === '/action' && init.method === 'POST') {
+      const body = JSON.parse(init.body);
+      postLog.push(body);
+      if (body.card_cid === 601) {
+        hand = hand.filter((c) => c.cid !== 601).map((c, idx) => ({ ...c, i: idx }));
+        targetKilled = true; // Teammate kills planned target [0] SLIME_S
+      } else if (body.card_cid === 602) {
+        hand = [];
+      }
+      const nextState = buildCombatStateFixture({
+        multiplayer: true,
+        hand: hand.map((c) => (c.targets.length > 0 ? {
+          ...c,
+          targets: targetKilled ? [0] : [0, 1],
+          vs: targetKilled ? [{ enemy: 0, damage: 6, kills: false }] : c.vs,
+        } : c)),
+        enemies: targetKilled ? enemiesAfterKill : enemiesStart,
+      });
+      return new Response(JSON.stringify({ ok: true, data: { action: body.action, status: 'completed', state: nextState } }), { status: 200 });
+    }
+    return new Response('{}', { status: 404 });
+  };
+
+  const client = new Sts2Client({ baseUrl: 'http://127.0.0.1:8080', fetchFn: mockFetch });
+  // Default retarget='safe': [0] SLIME_S died -> automatically retargets Strike onto safe [0] 邪教徒!
+  const res = await executeBatch(client, 'play 0; play 1 0; end', { mode: 'coop', seenCache: seen, pollIntervalMs: 10 });
+  assert.equal(res.stopReason, 'completed');
+  assert.equal(res.executed.length, 3);
+  assert.equal(res.retargeted.length, 1);
+  assert.equal(postLog[1].target_index, 0);
+  assert.match(res.stateText, /自动转火:\[0\]->\[0\]邪教徒/);
+});
+
+test('Opt 3b: default retarget="safe" blocks thorns/special-mechanic monsters, retarget="off" blocks all, and potions never retarget', async () => {
+  const tmpDir = makeTmpDir();
+  const seen = new SeenCache(path.join(tmpDir, 'seen.json'));
+
+  // Direct unit checks on isSafeRetargetEnemy
+  assert.equal(isSafeRetargetEnemy({ enemy_id: 'CULTIST', name: '邪教徒', powers: [], intent: 'PECK', move_id: 'PECK' }), true);
+  assert.equal(isSafeRetargetEnemy({ enemy_id: 'SPINY', name: '尖刺怪', powers: ['THORNS_POWER 3: 反射3点伤害'], intent: 'BUFF' }), false);
+  assert.equal(isSafeRetargetEnemy({ enemy_id: 'SLIME_L', name: '大史莱姆', powers: ['SPLIT: HP<=50%时分裂'], intent: 'ATTACK' }), false);
+  assert.equal(isSafeRetargetEnemy({ enemy_id: 'LAGAVULIN', name: '乐加维林', powers: [], intent: 'SLEEP', move_id: 'SLEEP' }), false);
+  assert.equal(isSafeRetargetEnemy({ enemy_id: 'NEMESIS', name: '天谴', powers: ['INTANGIBLE 1: 无实体'], intent: 'ATTACK' }), false);
+
+  const makeScenario = (remainingEnemy, seq, retargetOpt) => {
+    let killed = false;
+    let hand = [
+      {
+        i: 0,
+        cid: 701,
+        type: 'skill',
+        card_id: 'DEFEND_IRONCLAD',
+        line: '防御 [1费]：获得 5 点 格挡 。',
+        energy_cost: 1,
+        playable: true,
+        targets: [],
+      },
+      {
+        i: 1,
+        cid: 702,
+        type: 'attack',
+        card_id: 'STRIKE_IRONCLAD',
+        line: '打击 [1费]：造成 6 点伤害。',
+        energy_cost: 1,
+        playable: true,
+        targets: [0, 1],
+        vs: [
+          { enemy: 0, damage: 6, kills: false },
+          { enemy: 1, damage: 6, kills: false },
+        ],
+      },
+    ];
+    const startEnemies = [
+      {
+        i: 0,
+        enemy_id: 'SLIME_S',
+        name: '酸液史莱姆(小)',
+        hp: '6/12',
+        block: 0,
+        intent: 'TACKLE',
+        move_id: 'TACKLE',
+        powers: [],
+        intents: [{ i: 0, intent_type: 'Attack', damage: 3, hits: 1, total_damage: 3 }],
+        alive: true,
+        hittable: true,
+      },
+      { ...remainingEnemy, i: 1, alive: true, hittable: true },
+    ];
+    const afterEnemies = [{ ...remainingEnemy, i: 0, alive: true, hittable: true }];
+
+    const mockFetch = async (url, init) => {
+      const parsedUrl = new URL(url);
+      const curEnemies = killed ? afterEnemies : startEnemies;
+      const curHand = hand.map((c) => (c.targets.length > 0 ? {
+        ...c,
+        targets: killed ? [0] : [0, 1],
+        vs: killed ? [{ enemy: 0, damage: 6, kills: false }] : c.vs,
+      } : c));
+      if (parsedUrl.pathname === '/decision-snapshot') {
+        const state = buildCombatStateFixture({ multiplayer: true, hand: curHand, enemies: curEnemies });
+        state.available_actions = ['play_card', 'use_potion', 'end_turn'];
+        return new Response(JSON.stringify({ ok: true, data: { state, available_actions: state.available_actions } }), { status: 200 });
+      }
+      if (parsedUrl.pathname === '/action' && init.method === 'POST') {
+        const body = JSON.parse(init.body);
+        if (body.card_cid === 701) {
+          hand = hand.filter((c) => c.cid !== 701).map((c, idx) => ({ ...c, i: idx }));
+          killed = true;
+        }
+        const nextState = buildCombatStateFixture({
+          multiplayer: true,
+          hand: hand.map((c) => (c.targets.length > 0 ? {
+            ...c,
+            targets: killed ? [0] : [0, 1],
+            vs: killed ? [{ enemy: 0, damage: 6, kills: false }] : c.vs,
+          } : c)),
+          enemies: killed ? afterEnemies : startEnemies,
+        });
+        nextState.available_actions = ['play_card', 'use_potion', 'end_turn'];
+        return new Response(JSON.stringify({ ok: true, data: { action: body.action, status: 'completed', state: nextState } }), { status: 200 });
+      }
+      return new Response('{}', { status: 404 });
+    };
+
+    const client = new Sts2Client({ baseUrl: 'http://127.0.0.1:8080', fetchFn: mockFetch });
+    return executeBatch(client, seq, { mode: 'coop', seenCache: seen, pollIntervalMs: 10, retarget: retargetOpt });
+  };
+
+  // 1) Thorns monster refuses auto-retarget under default 'safe'
+  const thornsEnemy = {
+    enemy_id: 'GUARDIAN',
+    name: '守护者',
+    hp: '80/80',
+    block: 0,
+    intent: 'DEFENSIVE_MODE',
+    move_id: 'DEFENSIVE_MODE',
+    powers: ['THORNS_POWER 3: 每次受击反射 3 点伤害。'],
+    intents: [{ i: 0, intent_type: 'Buff', damage: 0, hits: 0, total_damage: 0 }],
+  };
+  const thornsRes = await makeScenario(thornsEnemy, 'play 0; play 1 0; end', undefined);
+  assert.equal(thornsRes.stopReason, 'target_gone');
+  assert.match(thornsRes.stopDetail, /反伤\/特殊机制/);
+  assert.equal(thornsRes.executed.length, 1);
+
+  // 2) retarget='any' overrides safety guard on thorns monster
+  const anyRes = await makeScenario(thornsEnemy, 'play 0; play 1 0; end', 'any');
+  assert.equal(anyRes.stopReason, 'completed');
+  assert.equal(anyRes.executed.length, 3);
+  assert.equal(anyRes.retargeted.length, 1);
+
+  // 3) retarget='off' stops even on safe normal enemy
+  const safeEnemy = {
+    enemy_id: 'CULTIST',
+    name: '邪教徒',
+    hp: '35/50',
+    block: 0,
+    intent: 'PECK_MOVE',
+    move_id: 'PECK_MOVE',
+    powers: [],
+    intents: [{ i: 0, intent_type: 'Attack', damage: 6, hits: 1, total_damage: 6 }],
+  };
+  const offRes = await makeScenario(safeEnemy, 'play 0; play 1 0', 'off');
+  assert.equal(offRes.stopReason, 'target_gone');
+  assert.equal(offRes.executed.length, 1);
+
+  // 4) Potions never auto-retarget even when remaining enemy is safe
+  const potionRes = await makeScenario(safeEnemy, 'play 0; potion 0 0', 'safe');
+  assert.equal(potionRes.stopReason, 'target_gone');
+  assert.match(potionRes.stopDetail, /药水不自动转火/);
+  assert.equal(potionRes.executed.length, 1);
+});
+
+test('Opt 4a: waitForTurnReady wakes via SSE /events/stream and falls back to poll on 404', async () => {
+  // Part A: SSE stream wakes waitForTurnReady cleanly
+  let turnReadyA = false;
+  const mockFetchSse = async (url) => {
+    const parsedUrl = new URL(url);
+    if (parsedUrl.pathname === '/decision-snapshot') {
+      const state = buildCombatStateFixture({ multiplayer: true, turn: turnReadyA ? 2 : 1 });
+      if (!turnReadyA) {
+        state.combat.action_readiness = {
+          can_use_combat_actions: false,
+          local_ready_to_end_turn: true,
+          all_players_ready_to_end_turn: false,
+        };
+      }
+      return new Response(JSON.stringify({ ok: true, data: { state, available_actions: state.available_actions } }), { status: 200 });
+    }
+    if (parsedUrl.pathname === '/events/stream') {
+      const encoder = new TextEncoder();
+      const stream = new ReadableStream({
+        start(controller) {
+          controller.enqueue(encoder.encode(': stream opened\n\n'));
+          setTimeout(() => {
+            turnReadyA = true;
+            controller.enqueue(encoder.encode('data: {"type":"turn_changed","turn":2}\n\n'));
+          }, 25);
+        },
+      });
+      return new Response(stream, {
+        status: 200,
+        headers: { 'Content-Type': 'text/event-stream' },
+      });
+    }
+    return new Response('{}', { status: 404 });
+  };
+
+  const clientSse = new Sts2Client({ baseUrl: 'http://127.0.0.1:8080', fetchFn: mockFetchSse });
+  const resSse = await clientSse.waitForTurnReady({ timeoutMs: 2000, debounceMs: 15, pollIntervalMs: 300 });
+  assert.equal(resSse.ready, true);
+  assert.equal(resSse.via, 'sse');
+  assert.equal(resSse.snapshot.state.turn, 2);
+
+  // Part B: 404 on /events/stream falls back to polling
+  let snapCountB = 0;
+  const mockFetchPoll = async (url) => {
+    const parsedUrl = new URL(url);
+    if (parsedUrl.pathname === '/events/stream') {
+      return new Response('Not Found', { status: 404 });
+    }
+    if (parsedUrl.pathname === '/decision-snapshot') {
+      snapCountB += 1;
+      const ready = snapCountB >= 2;
+      const state = buildCombatStateFixture({ multiplayer: true, turn: ready ? 2 : 1 });
+      if (!ready) {
+        state.combat.action_readiness = {
+          can_use_combat_actions: false,
+          local_ready_to_end_turn: true,
+          all_players_ready_to_end_turn: false,
+        };
+      }
+      return new Response(JSON.stringify({ ok: true, data: { state, available_actions: state.available_actions } }), { status: 200 });
+    }
+    return new Response('{}', { status: 404 });
+  };
+
+  const clientPoll = new Sts2Client({ baseUrl: 'http://127.0.0.1:8080', fetchFn: mockFetchPoll });
+  const resPoll = await clientPoll.waitForTurnReady({ timeoutMs: 2000, pollIntervalMs: 20 });
+  assert.equal(resPoll.ready, true);
+  assert.equal(resPoll.via, 'poll');
+  assert.equal(resPoll.snapshot.state.turn, 2);
+});
+
+test('Opt 4b: executeBatch with waitForTurn=true blocks via SSE after end_turn until Turn 2 ready', async () => {
+  const tmpDir = makeTmpDir();
+  const seen = new SeenCache(path.join(tmpDir, 'seen.json'));
+
+  let phase = 'turn1'; // 'turn1' -> 'waiting' -> 'turn2'
+  const mockFetch = async (url, init) => {
+    const parsedUrl = new URL(url);
+    const makeCurrentState = () => {
+      const turn = phase === 'turn2' ? 2 : 1;
+      const state = buildCombatStateFixture({ multiplayer: true, turn });
+      if (phase === 'waiting') {
+        state.combat.action_readiness = {
+          can_use_combat_actions: false,
+          local_ready_to_end_turn: true,
+          all_players_ready_to_end_turn: false,
+        };
+      }
+      return state;
+    };
+
+    if (parsedUrl.pathname === '/decision-snapshot') {
+      const state = makeCurrentState();
+      return new Response(JSON.stringify({ ok: true, data: { state, available_actions: state.available_actions } }), { status: 200 });
+    }
+    if (parsedUrl.pathname === '/action' && init.method === 'POST') {
+      const body = JSON.parse(init.body);
+      if (body.action === 'end_turn') {
+        phase = 'waiting';
+      }
+      const nextState = makeCurrentState();
+      return new Response(JSON.stringify({ ok: true, data: { action: body.action, status: 'completed', state: nextState } }), { status: 200 });
+    }
+    if (parsedUrl.pathname === '/events/stream') {
+      const encoder = new TextEncoder();
+      const stream = new ReadableStream({
+        start(controller) {
+          controller.enqueue(encoder.encode(': stream opened\n\n'));
+          setTimeout(() => {
+            phase = 'turn2';
+            controller.enqueue(encoder.encode('data: {"type":"turn_started","turn":2}\n\n'));
+          }, 25);
+        },
+      });
+      return new Response(stream, {
+        status: 200,
+        headers: { 'Content-Type': 'text/event-stream' },
+      });
+    }
+    return new Response('{}', { status: 404 });
+  };
+
+  const client = new Sts2Client({ baseUrl: 'http://127.0.0.1:8080', fetchFn: mockFetch });
+  const res = await executeBatch(client, 'end', {
+    mode: 'coop',
+    seenCache: seen,
+    pollIntervalMs: 10,
+    settleTimeoutMs: 500,
+    waitForTurn: true,
+    waitTimeoutMs: 2000,
+  });
+
+  assert.equal(res.stopReason, 'completed');
+  assert.equal(res.executed.length, 1);
+  assert.equal(res.waitVia, 'sse');
+  assert.equal(res.finalState.turn, 2);
+  assert.match(res.stateText, /等回合:sse/);
+  assert.match(res.stateText, /T2/);
 });

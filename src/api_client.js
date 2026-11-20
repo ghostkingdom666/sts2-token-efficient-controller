@@ -98,6 +98,51 @@ export function detectSessionContext(state) {
 }
 
 /**
+ * Returns true if combat actions are temporarily blocked by a transient gate
+ * (e.g. Mod 200ms snapshot_stabilizing window or teammate animation settling),
+ * rather than a hard modal/selection/waiting-for-others barrier.
+ */
+export function isTransientReadinessBlock(state) {
+  if (!state || state.screen !== 'COMBAT') return false;
+  if (state.selection || state.modal) return false;
+  if (detectSessionContext(state).waitingForOthers) return false;
+  const r = state.combat?.action_readiness;
+  if (!r || typeof r !== 'object') return false;
+  if (
+    r.modal_open === true
+    || r.hand_in_card_selection === true
+    || r.is_paused === true
+    || r.local_ready_to_end_turn === true
+  ) {
+    return false;
+  }
+  if (r.can_use_combat_actions === false) {
+    return Boolean(
+      r.actions_settled === false
+      || r.running_action_type != null
+      || r.ready_action_type != null
+      || /stabiliz|settl|in_flight|running|ready_action|busy|not_ready/i.test(String(r.reason || '')),
+    );
+  }
+  return false;
+}
+
+function isSnapshotActionable(snap) {
+  const st = snap?.state;
+  const screen = st?.screen || 'UNKNOWN';
+  if (screen === 'UNKNOWN') return false;
+  const readiness = st?.combat?.action_readiness;
+  if (screen === 'COMBAT' && readiness) {
+    if (readiness.can_use_combat_actions === true) return true;
+    // Non-combat overlays inside combat (e.g., hand/grid selection or blocking modal) are actionable immediately.
+    if (st?.selection || st?.modal) return true;
+    return false;
+  }
+  if (Array.isArray(st?.available_actions) && st.available_actions.length > 0) return true;
+  return screen === 'PAUSE_MENU' || screen === 'GAME_OVER';
+}
+
+/**
  * Discovers live STS2AIAgent HTTP endpoints from temp hint files and standard ports.
  */
 export async function discoverInstances({
@@ -375,7 +420,7 @@ export class Sts2Client {
   /**
    * Polls /decision-snapshot until the game settles into an actionable frame or hits timeout.
    */
-  async waitUntilActionable({ timeoutMs = 8000, pollIntervalMs = 180 } = {}) {
+  async waitUntilActionable({ timeoutMs = 8000, pollIntervalMs = 60 } = {}) {
     const deadline = Date.now() + timeoutMs;
     let lastSnap = null;
 
@@ -396,22 +441,8 @@ export class Sts2Client {
         return { actionable: false, waitingForOthers: true, snapshot: lastSnap };
       }
 
-      const screen = st?.screen || 'UNKNOWN';
-      if (screen !== 'UNKNOWN') {
-        const readiness = st?.combat?.action_readiness;
-        if (screen === 'COMBAT' && readiness) {
-          if (readiness.can_use_combat_actions === true) {
-            return { actionable: true, waitingForOthers: false, snapshot: lastSnap };
-          }
-          // Non-combat overlays inside combat (e.g., hand/grid selection or blocking modal) are actionable immediately.
-          if (st?.selection || st?.modal) {
-            return { actionable: true, waitingForOthers: false, snapshot: lastSnap };
-          }
-        } else if (Array.isArray(st?.available_actions) && st.available_actions.length > 0) {
-          return { actionable: true, waitingForOthers: false, snapshot: lastSnap };
-        } else if (screen === 'PAUSE_MENU' || screen === 'GAME_OVER') {
-          return { actionable: true, waitingForOthers: false, snapshot: lastSnap };
-        }
+      if (isSnapshotActionable(lastSnap)) {
+        return { actionable: true, waitingForOthers: false, snapshot: lastSnap };
       }
 
       if (Date.now() >= deadline) {
@@ -419,5 +450,168 @@ export class Sts2Client {
       }
       await sleep(pollIntervalMs);
     }
+  }
+
+  /**
+   * Blocks (at zero LLM token cost) while waiting for multiplayer teammates to finish their actions/turn.
+   * Subscribes to GET /events/stream (SSE) with debounced snapshot checks and falls back cleanly to polling.
+   */
+  async waitForTurnReady({
+    timeoutMs = 120_000,
+    pollIntervalMs = 220,
+    debounceMs = 80,
+    useSse = true,
+  } = {}) {
+    const deadline = Date.now() + timeoutMs;
+    let lastSnap = null;
+
+    const probeOnce = async () => {
+      try {
+        lastSnap = await this.getSnapshot();
+      } catch (error) {
+        if (error instanceof Sts2ApiError && error.code === 'state_unavailable') {
+          return false;
+        }
+        throw error;
+      }
+      const ctx = detectSessionContext(lastSnap.state);
+      return !ctx.waitingForOthers && isSnapshotActionable(lastSnap);
+    };
+
+    if (await probeOnce()) {
+      return { ready: true, via: 'immediate', snapshot: lastSnap };
+    }
+
+    if (useSse && Date.now() < deadline) {
+      const base = await this.resolveBaseUrl();
+      const sseAbort = new AbortController();
+      let reader = null;
+      let debounceTimer = null;
+      let safetyInterval = null;
+      let timeoutTimer = null;
+      let settled = false;
+
+      try {
+        const res = await this.fetchFn(`${base}/events/stream`, {
+          method: 'GET',
+          headers: { Accept: 'text/event-stream' },
+          signal: sseAbort.signal,
+        });
+
+        if (res.ok && res.body && typeof res.body.getReader === 'function') {
+          reader = res.body.getReader();
+          const decoder = new TextDecoder();
+
+          const sseResult = await new Promise((resolve, reject) => {
+            const finish = (val) => {
+              if (settled) return;
+              settled = true;
+              clearTimeout(debounceTimer);
+              clearInterval(safetyInterval);
+              clearTimeout(timeoutTimer);
+              sseAbort.abort();
+              resolve(val);
+            };
+            const fail = (err) => {
+              if (settled) return;
+              settled = true;
+              clearTimeout(debounceTimer);
+              clearInterval(safetyInterval);
+              clearTimeout(timeoutTimer);
+              sseAbort.abort();
+              reject(err);
+            };
+
+            let hasPendingDataCheck = false;
+            const triggerCheck = async () => {
+              if (settled) return;
+              hasPendingDataCheck = false;
+              try {
+                if (await probeOnce()) {
+                  finish({ ready: true, via: 'sse', snapshot: lastSnap });
+                } else if (Date.now() >= deadline) {
+                  finish({ ready: false, via: 'timeout', snapshot: lastSnap });
+                }
+              } catch (err) {
+                fail(err);
+              }
+            };
+
+            const scheduleDebouncedCheck = () => {
+              if (settled) return;
+              hasPendingDataCheck = true;
+              if (debounceMs <= 0) {
+                void triggerCheck();
+                return;
+              }
+              clearTimeout(debounceTimer);
+              debounceTimer = setTimeout(() => { void triggerCheck(); }, debounceMs);
+            };
+
+            timeoutTimer = setTimeout(() => {
+              finish({ ready: false, via: 'timeout', snapshot: lastSnap });
+            }, Math.max(10, deadline - Date.now()));
+
+            // Safety fallback probe in case a non-combat screen change emits no SSE event.
+            safetyInterval = setInterval(() => { void triggerCheck(); }, 1200);
+
+            (async () => {
+              let buffer = '';
+              try {
+                while (!settled) {
+                  const { value, done } = await reader.read();
+                  if (done) {
+                    if (hasPendingDataCheck || buffer.includes('data:')) {
+                      clearTimeout(debounceTimer);
+                      await triggerCheck();
+                    }
+                    if (!settled) finish(null);
+                    break;
+                  }
+                  buffer += decoder.decode(value, { stream: true });
+                  const lines = buffer.split('\n');
+                  buffer = lines.pop() ?? '';
+                  if (lines.some((line) => line.startsWith('data:'))) {
+                    scheduleDebouncedCheck();
+                  }
+                }
+              } catch (err) {
+                if (err?.name === 'AbortError' || settled) {
+                  finish(null);
+                } else {
+                  finish(null); // Fall back to polling cleanly on SSE stream errors
+                }
+              }
+            })();
+          });
+
+          if (sseResult) {
+            return sseResult;
+          }
+        }
+      } catch {
+        // SSE unavailable or blocked; fall back to polling loop cleanly.
+      } finally {
+        clearTimeout(debounceTimer);
+        clearInterval(safetyInterval);
+        clearTimeout(timeoutTimer);
+        sseAbort.abort();
+        try {
+          await reader?.cancel();
+        } catch {
+          // Ignore cancel error
+        }
+      }
+    }
+
+    // Polling fallback (used when /events/stream is 404/unsupported or closes early)
+    while (Date.now() < deadline) {
+      await sleep(Math.min(pollIntervalMs, Math.max(10, deadline - Date.now())));
+      if (await probeOnce()) {
+        return { ready: true, via: 'poll', snapshot: lastSnap };
+      }
+    }
+
+    return { ready: false, via: 'timeout', snapshot: lastSnap };
   }
 }

@@ -1,5 +1,17 @@
-import { detectSessionContext, Sts2ApiError } from './api_client.js';
+import { detectSessionContext, isTransientReadinessBlock, Sts2ApiError } from './api_client.js';
 import { compressState, needsAssistConfirmation, parseHpPair, SeenCache } from './compressor.js';
+
+const TRANSIENT_POST_CODES = new Set([
+  'action_in_flight',
+  'invalid_action',
+  'combat_actions_not_ready',
+  'snapshot_stabilizing',
+  'state_unavailable',
+]);
+
+const RETARGET_THORNS_REGEX = /THORNS|SHARP_HIDE|FLAME_BARRIER|SPIK|COUNTER|RETALIAT|BARB|荆棘|尖刺|反伤|反击|火焰屏障|被攻击.*伤害|受到攻击.*造成/i;
+const RETARGET_SPECIAL_REGEX = /ANGER|ENRAGE|MALLEABLE|CURL_UP|MODE_SHIFT|SPLIT|SPORE_CLOUD|EXPLOSIVE|REACTIVE|SLEEP|ASLEEP|DORMANT|UNAWAKENED|INTANGIBLE|INVINCIBLE|HARDENED_SHELL|SLIPPERY|SHIFTING|BEAT_OF_DEATH|TIME_WARP|CURIOSITY|激怒|暴怒|韧性|柔韧|蜷缩|分裂|孢子|爆炸|模式切换|反应性|沉睡|休眠|唤醒|无实体|无敌|坚硬外壳|死亡时.*造成|死亡时.*易伤|受击.*力量|受击.*格挡|受到攻击.*格挡|受到攻击.*力量/i;
+const SLEEP_INTENT_REGEX = /SLEEP|DORMANT|ASLEEP/i;
 
 function parseIntegerToken(token, label) {
   const num = Number.parseInt(String(token), 10);
@@ -329,6 +341,14 @@ function getLocalHp(state) {
   return parseHpPair(p.hp, p.current_hp, p.max_hp).current;
 }
 
+function normalizePowerText(pw) {
+  if (typeof pw === 'string') return pw;
+  if (pw && typeof pw === 'object') {
+    return [pw.power_id, pw.id, pw.name, pw.line, pw.description].filter(Boolean).join(' ');
+  }
+  return '';
+}
+
 function getAliveEnemySnapshot(state) {
   const enemies = Array.isArray(state?.combat?.enemies) ? state.combat.enemies : [];
   const list = [];
@@ -343,16 +363,201 @@ function getAliveEnemySnapshot(state) {
           hits: it.hits ?? null,
         }))
       : [];
+    let totalAttackDamage = 0;
+    for (const it of intents) {
+      if (it.type === 'Attack') {
+        if (typeof it.tot === 'number') totalAttackDamage += it.tot;
+        else if (typeof it.dmg === 'number') totalAttackDamage += it.dmg * (typeof it.hits === 'number' ? it.hits : 1);
+      }
+    }
     list.push({
       idx,
+      instance_id: e.instance_id ?? e.id ?? e.uid ?? null,
       enemy_id: e.enemy_id || e.name || '',
+      name: e.name || e.enemy_id || '敌人',
+      hp: parseHpPair(e.hp, e.current_hp, e.max_hp),
+      block: e.block ?? 0,
+      powers: Array.isArray(e.powers) ? e.powers : [],
       hittable: e.hittable ?? e.is_hittable ?? true,
       intent: e.intent || '',
       move_id: e.move_id || '',
       intents,
+      totalAttackDamage,
     });
   }
   return list;
+}
+
+function scoreEnemyPair(pe, ce) {
+  if (pe.enemy_id && ce.enemy_id && pe.enemy_id !== ce.enemy_id) {
+    return Number.NEGATIVE_INFINITY;
+  }
+  let score = 10;
+  if (pe.hp?.max > 0 && ce.hp?.max > 0) {
+    score += pe.hp.max === ce.hp.max ? 15 : -15;
+  }
+  if (pe.move_id && ce.move_id && pe.move_id === ce.move_id) {
+    score += 25;
+  } else if (pe.intent && ce.intent && pe.intent === ce.intent) {
+    score += 20;
+  }
+  if (pe.hp?.max > 0 && ce.hp?.max > 0) {
+    if (ce.hp.current <= pe.hp.current) {
+      const drop = pe.hp.current - ce.hp.current;
+      score += Math.max(0, 15 - Math.min(15, drop / 5));
+    } else {
+      score -= 10;
+    }
+  }
+  if (pe.idx === ce.idx) {
+    score += 2;
+  }
+  return score;
+}
+
+/**
+ * Matches surviving enemies across states while tolerating teammate kills that shift array indices left.
+ */
+export function matchEnemiesAcrossStates(planEnemies, curEnemies) {
+  const matchedPairs = [];
+  const curToPlan = new Map();
+  const planIdxToCur = new Map();
+  const usedPlanIdx = new Set();
+  const usedCurIdx = new Set();
+
+  // Pass 1: exact instance_id matching when exposed by the mod.
+  for (const ce of curEnemies) {
+    if (ce.instance_id === null || ce.instance_id === undefined) continue;
+    const pe = planEnemies.find((p) => !usedPlanIdx.has(p.idx) && p.instance_id === ce.instance_id);
+    if (pe) {
+      usedPlanIdx.add(pe.idx);
+      usedCurIdx.add(ce.idx);
+      matchedPairs.push({ plan: pe, cur: ce });
+      curToPlan.set(ce.idx, pe);
+      planIdxToCur.set(pe.idx, ce);
+    }
+  }
+
+  // Pass 2: order-preserving sequence alignment on remaining enemies.
+  const remPlan = planEnemies.filter((p) => !usedPlanIdx.has(p.idx));
+  const remCur = curEnemies.filter((c) => !usedCurIdx.has(c.idx));
+
+  if (remPlan.length > 0 && remCur.length > 0) {
+    const memo = new Map();
+    const solve = (ci, pi) => {
+      if (ci >= remCur.length) return { score: 0, pairs: [] };
+      if (pi >= remPlan.length) {
+        return { score: -1000 * (remCur.length - ci), pairs: [] };
+      }
+      const key = `${ci}:${pi}`;
+      if (memo.has(key)) return memo.get(key);
+
+      // Option 1: skip plan[pi] (treated as killed)
+      let best = solve(ci, pi + 1);
+
+      // Option 2: match cur[ci] <-> plan[pi]
+      const pairScore = scoreEnemyPair(remPlan[pi], remCur[ci]);
+      if (Number.isFinite(pairScore)) {
+        const sub = solve(ci + 1, pi + 1);
+        const total = pairScore + sub.score;
+        if (total > best.score) {
+          best = { score: total, pairs: [{ plan: remPlan[pi], cur: remCur[ci] }, ...sub.pairs] };
+        }
+      }
+
+      // Option 3: skip cur[ci] (treated as newly spawned)
+      const skipCur = solve(ci + 1, pi);
+      if (skipCur.score - 1000 > best.score) {
+        best = { score: skipCur.score - 1000, pairs: skipCur.pairs };
+      }
+
+      memo.set(key, best);
+      return best;
+    };
+
+    const aligned = solve(0, 0);
+    for (const pair of aligned.pairs) {
+      usedPlanIdx.add(pair.plan.idx);
+      usedCurIdx.add(pair.cur.idx);
+      matchedPairs.push(pair);
+      curToPlan.set(pair.cur.idx, pair.plan);
+      planIdxToCur.set(pair.plan.idx, pair.cur);
+    }
+  }
+
+  const spawned = curEnemies.filter((c) => !usedCurIdx.has(c.idx));
+  return { matchedPairs, curToPlan, planIdxToCur, spawned };
+}
+
+/**
+ * Optimization 3 safety gate: returns true only when an enemy is hittable and free of
+ * thorns/retaliation or special trigger powers (split/enrage/curl-up/sleep/intangible/etc.).
+ */
+export function isSafeRetargetEnemy(enemy) {
+  if (!enemy || enemy.hittable === false) return false;
+  if (SLEEP_INTENT_REGEX.test(enemy.intent || '') || SLEEP_INTENT_REGEX.test(enemy.move_id || '')) {
+    return false;
+  }
+  const powers = Array.isArray(enemy.powers) ? enemy.powers : [];
+  for (const pw of powers) {
+    const text = normalizePowerText(pw);
+    if (!text) continue;
+    if (RETARGET_THORNS_REGEX.test(text) || RETARGET_SPECIAL_REGEX.test(text)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * Picks a safe replacement target for a single-target card when the original target died (e.g. killed by teammate).
+ */
+export function pickSafeRetarget(card, curEnemies, { retargetMode = 'safe' } = {}) {
+  if (!card || retargetMode === 'off') return null;
+  const validTargets = Array.isArray(card.targets)
+    ? card.targets
+    : (Array.isArray(card.valid_target_indices) ? card.valid_target_indices : []);
+  const vsList = Array.isArray(card.vs) ? card.vs : [];
+
+  const candidates = curEnemies.filter((e) => {
+    if (e.hittable === false) return false;
+    if (validTargets.length > 0 && !validTargets.includes(e.idx)) return false;
+    if (retargetMode === 'safe') {
+      if (!isSafeRetargetEnemy(e)) return false;
+      const vsEntry = vsList.find((v) => v.enemy === e.idx);
+      if (vsEntry) {
+        const dmg = vsEntry.damage ?? vsEntry.per_hit ?? null;
+        if (dmg === 0) return false;
+      }
+    }
+    return true;
+  });
+
+  if (candidates.length === 0) return null;
+
+  const ranked = candidates.map((e) => {
+    const vsEntry = vsList.find((v) => v.enemy === e.idx);
+    const kills = Boolean(
+      vsEntry?.kills
+      || (vsEntry && typeof vsEntry.damage === 'number' && vsEntry.damage >= (e.hp?.current ?? 0) + (e.block ?? 0)),
+    );
+    const effectiveHp = (e.hp?.current ?? 0) + (e.block ?? 0);
+    return {
+      enemy: e,
+      kills: kills ? 1 : 0,
+      threat: e.totalAttackDamage ?? 0,
+      effectiveHp,
+    };
+  });
+
+  ranked.sort((a, b) => (
+    (b.kills - a.kills)
+    || (b.threat - a.threat)
+    || (a.effectiveHp - b.effectiveHp)
+    || (a.enemy.idx - b.enemy.idx)
+  ));
+
+  return ranked[0].enemy;
 }
 
 /**
@@ -378,14 +583,37 @@ export function bindHandCardCids(steps, initialState) {
 }
 
 /**
+ * Records initial enemy target indices so cross-step enemy deaths shifting indices left
+ * can be safely remapped instead of falsely aborting or hitting the wrong slot.
+ */
+export function bindStepTargets(steps, initialState) {
+  const planEnemies = getAliveEnemySnapshot(initialState);
+  return steps.map((step) => {
+    if (
+      (step.action === 'play_card' || step.action === 'use_potion')
+      && step.target_index !== undefined
+      && step.target_index !== null
+    ) {
+      return {
+        ...step,
+        _planTargetIdx: step.target_index,
+        _planEnemySnapshotCount: planEnemies.length,
+      };
+    }
+    return { ...step };
+  });
+}
+
+/**
  * Detects whether combat state diverged in a way that invalidates the rest of the queued turn plan.
  * Returns null if safe to continue, or { reason, detail } if the queue should interrupt immediately.
  */
-export function detectCombatDivergence(planState, preStepState, currentState, nextStep = null, stepIndex = 0, lastAction = null) {
+export function detectCombatDivergence(planState, preStepState, currentState, nextStep = null, stepIndex = 0, lastAction = null, options = {}) {
   if (!planState || !currentState) {
     return { reason: 'state_unavailable', detail: '无法读取最新战斗状态' };
   }
 
+  const retargetMode = options.retargetMode ?? 'safe';
   const curScreen = currentState.screen;
   const readiness = currentState.combat?.action_readiness;
   if (
@@ -432,16 +660,17 @@ export function detectCombatDivergence(planState, preStepState, currentState, ne
     return { reason: 'took_damage', detail: `我方生命减少 (${hpBefore} -> ${hpAfter})，中断队列重新评估` };
   }
 
-  // Enemy spawn or intent escalation check
+  // Order-preserving enemy matching across teammate kills & index shifts
   const planEnemies = getAliveEnemySnapshot(planState);
   const curEnemies = getAliveEnemySnapshot(currentState);
-  const planAliveMap = new Map(planEnemies.map((e) => [`${e.idx}:${e.enemy_id}`, e]));
-  for (const ce of curEnemies) {
-    const key = `${ce.idx}:${ce.enemy_id}`;
-    const pe = planAliveMap.get(key);
-    if (!pe) {
-      return { reason: 'enemies_changed', detail: `场上出现新敌人或位置变化: [${ce.idx}] ${ce.enemy_id}` };
-    }
+  const { matchedPairs, planIdxToCur, spawned } = matchEnemiesAcrossStates(planEnemies, curEnemies);
+
+  if (spawned.length > 0) {
+    const s = spawned[0];
+    return { reason: 'enemies_changed', detail: `场上出现新敌人或位置变化: [${s.idx}] ${s.enemy_id}` };
+  }
+
+  for (const { plan: pe, cur: ce } of matchedPairs) {
     if (pe.intent !== ce.intent || pe.move_id !== ce.move_id) {
       return { reason: 'intent_changed', detail: `敌人 [${ce.idx}] 意图变化 (${pe.intent} -> ${ce.intent})` };
     }
@@ -454,6 +683,8 @@ export function detectCombatDivergence(planState, preStepState, currentState, ne
       return { reason: 'illegal_action', detail: `第 ${stepIndex + 1} 步动作 ${nextStep.action} 当前不可用` };
     }
 
+    const origTargetIdx = nextStep._planTargetIdx ?? nextStep.target_index;
+
     if (nextStep.action === 'play_card') {
       const hand = getHandList(currentState);
       const card = nextStep.card_cid !== undefined && nextStep.card_cid !== null
@@ -461,7 +692,7 @@ export function detectCombatDivergence(planState, preStepState, currentState, ne
         : hand.find((c) => (c.i ?? c.index) === nextStep.card_index);
 
       if (!card) {
-        return { reason: 'card_gone', detail: `后续出牌目标已不在手牌中` };
+        return { reason: 'card_gone', detail: '后续出牌目标已不在手牌中' };
       }
       if (!card.playable) {
         return {
@@ -469,14 +700,33 @@ export function detectCombatDivergence(planState, preStepState, currentState, ne
           detail: `后续卡牌 ${card.line || card.name || card.card_id} 当前不可打出 (${card.why || card.unplayable_reason || 'unplayable'})`,
         };
       }
+
       const validTargets = Array.isArray(card.targets)
         ? card.targets
         : (Array.isArray(card.valid_target_indices) ? card.valid_target_indices : []);
-      if (validTargets.length > 0 && nextStep.target_index !== undefined && nextStep.target_index !== null) {
-        const enemyStanding = curEnemies.some((e) => e.idx === nextStep.target_index && e.hittable);
-        if (!validTargets.includes(nextStep.target_index) || !enemyStanding) {
-          return { reason: 'target_gone', detail: `目标敌人 [${nextStep.target_index}] 已死亡或不可选中` };
+      if (validTargets.length > 0 && origTargetIdx !== undefined && origTargetIdx !== null) {
+        const mappedEnemy = planIdxToCur.get(origTargetIdx);
+        const mappedAlive = Boolean(mappedEnemy && mappedEnemy.hittable && validTargets.includes(mappedEnemy.idx));
+        if (!mappedAlive) {
+          if (retargetMode === 'off') {
+            return { reason: 'target_gone', detail: `目标敌人 [${origTargetIdx}] 已死亡或不可选中` };
+          }
+          const safeCandidate = pickSafeRetarget(card, curEnemies, { retargetMode });
+          if (!safeCandidate) {
+            const anyAliveTarget = curEnemies.some((e) => e.hittable && validTargets.includes(e.idx));
+            return {
+              reason: 'target_gone',
+              detail: anyAliveTarget
+                ? `目标敌人 [${origTargetIdx}] 已死亡，剩余敌人存在反伤/特殊机制，已安全中断`
+                : `目标敌人 [${origTargetIdx}] 已死亡或不可选中`,
+            };
+          }
         }
+      }
+    } else if (nextStep.action === 'use_potion' && origTargetIdx !== undefined && origTargetIdx !== null) {
+      const mappedEnemy = planIdxToCur.get(origTargetIdx);
+      if (!mappedEnemy || !mappedEnemy.hittable) {
+        return { reason: 'target_gone', detail: `目标敌人 [${origTargetIdx}] 已死亡，药水不自动转火` };
       }
     }
   }
@@ -486,25 +736,59 @@ export function detectCombatDivergence(planState, preStepState, currentState, ne
 
 /**
  * Resolves a single step into exact POST /action payload fields using fresh state.
+ * Handles hand cid re-resolution, shifted enemy index remapping, and safe retargeting.
  */
-function resolveActionBody(step, currentState, reasonText) {
+function resolveActionBody(step, currentState, reasonText, {
+  planEnemies = null,
+  retargetMode = 'safe',
+  retargetedNotes = null,
+} = {}) {
   const body = { ...step };
   if (reasonText) {
     body.client_context = { decision_reason: reasonText };
   }
 
+  let matchedCard = null;
   if (body.action === 'play_card' && body.card_cid !== undefined && body.card_cid !== null) {
     const hand = getHandList(currentState);
-    const matched = hand.find((c) => (c.cid ?? c.combat_card_id) === body.card_cid);
-    if (!matched) {
+    matchedCard = hand.find((c) => (c.cid ?? c.combat_card_id) === body.card_cid);
+    if (!matchedCard) {
       throw new Sts2ApiError(`卡牌 cid:${body.card_cid} 已不在手牌中`, { code: 'card_gone' });
     }
-    body.card_index = matched.i ?? matched.index;
+    body.card_index = matchedCard.i ?? matchedCard.index;
+  } else if (body.action === 'play_card' && body.card_index !== undefined && body.card_index !== null) {
+    const hand = getHandList(currentState);
+    matchedCard = hand.find((c) => (c.i ?? c.index) === body.card_index) || null;
   }
 
-  // Strip helper-only nullish fields
+  const origTargetIdx = step._planTargetIdx ?? step.target_index;
+  if (
+    currentState?.screen === 'COMBAT'
+    && (body.action === 'play_card' || body.action === 'use_potion')
+    && origTargetIdx !== undefined
+    && origTargetIdx !== null
+  ) {
+    const curEnemies = getAliveEnemySnapshot(currentState);
+    const refPlanEnemies = Array.isArray(planEnemies) ? planEnemies : curEnemies;
+    const { planIdxToCur } = matchEnemiesAcrossStates(refPlanEnemies, curEnemies);
+    const mapped = planIdxToCur.get(origTargetIdx);
+
+    if (mapped && mapped.hittable) {
+      body.target_index = mapped.idx;
+    } else if (body.action === 'play_card' && matchedCard && retargetMode !== 'off') {
+      const candidate = pickSafeRetarget(matchedCard, curEnemies, { retargetMode });
+      if (candidate) {
+        body.target_index = candidate.idx;
+        if (Array.isArray(retargetedNotes)) {
+          retargetedNotes.push(`自动转火:[${origTargetIdx}]->[${candidate.idx}]${candidate.name}`);
+        }
+      }
+    }
+  }
+
+  // Strip internal helper-only fields and nullish values
   for (const key of Object.keys(body)) {
-    if (body[key] === undefined) delete body[key];
+    if (key.startsWith('_') || body[key] === undefined) delete body[key];
   }
   return body;
 }
@@ -604,8 +888,25 @@ export function pickTrivialAutoAction(state, mode, history = new Set()) {
 }
 
 /**
- * Executes a queued sequence of actions with combat divergence guards and optional auto-advance.
- * Returns { executed, stopReason, stopDetail, autoAdvanced, stateText, finalState }.
+ * Checks whether a freshly fetched snapshot still supports executing `step` right now
+ * (meaning the prior POST rejection was a transient gate race rather than an illegal action).
+ */
+function isStepLegalInSnapshot(step, snapState, { planState, preStepState, stepIndex, lastAction, retargetMode } = {}) {
+  if (!snapState) return false;
+  if (detectSessionContext(snapState).waitingForOthers) return false;
+  if (snapState.screen === 'COMBAT' && planState) {
+    const div = detectCombatDivergence(planState, preStepState, snapState, step, stepIndex, lastAction, { retargetMode });
+    if (div) return false;
+    return true;
+  }
+  const avail = Array.isArray(snapState.available_actions) ? snapState.available_actions : [];
+  return avail.length === 0 || avail.includes(step.action);
+}
+
+/**
+ * Executes a queued sequence of actions with combat divergence guards, transient readiness retries,
+ * multiplayer enemy-shift tolerance, safe retargeting, and optional auto-advance / turn wait.
+ * Returns { executed, stopReason, stopDetail, autoAdvanced, retargeted, waitVia, stateText, finalState }.
  */
 export async function executeBatch(client, sequenceInput, {
   mode = 'auto',
@@ -614,27 +915,51 @@ export async function executeBatch(client, sequenceInput, {
   seenCache = new SeenCache(),
   maxAutoAdvance = 8,
   settleTimeoutMs = 5000,
+  pollIntervalMs = 60,
+  maxTransientRetries = 3,
+  retarget = 'safe',
+  waitForTurn = false,
+  waitTimeoutMs = 120_000,
 } = {}) {
+  const retargetMode = ['safe', 'off', 'any'].includes(String(retarget).toLowerCase())
+    ? String(retarget).toLowerCase()
+    : 'safe';
   const rawSteps = parseActionSequence(sequenceInput);
   const initialSnap = await client.getSnapshot();
   let currentSnap = initialSnap;
 
+  // Optimization 1a: if Step 0 hits a transient gate (e.g. Mod 200ms snapshot_stabilizing from teammate card), wait cleanly first!
+  if (currentSnap.state?.screen === 'COMBAT' && isTransientReadinessBlock(currentSnap.state)) {
+    const waitStart = await client.waitUntilActionable({ timeoutMs: settleTimeoutMs, pollIntervalMs });
+    currentSnap = waitStart.snapshot;
+  }
+
   const isCombatQueue = currentSnap.state?.screen === 'COMBAT';
-  const boundSteps = isCombatQueue ? bindHandCardCids(rawSteps, currentSnap.state) : rawSteps;
+  let boundSteps = isCombatQueue ? bindHandCardCids(rawSteps, currentSnap.state) : rawSteps;
+  if (isCombatQueue) boundSteps = bindStepTargets(boundSteps, currentSnap.state);
   const planState = currentSnap.state;
+  const planEnemies = isCombatQueue ? getAliveEnemySnapshot(planState) : [];
 
   const executed = [];
+  const retargetedNotes = [];
   let stopReason = 'completed';
   let stopDetail = null;
+  let waitVia = null;
   let lastPreStepState = null;
   let lastExecutedAction = null;
 
   for (let idx = 0; idx < boundSteps.length; idx += 1) {
     const step = boundSteps[idx];
 
+    if (idx === 0 && isCombatQueue && detectSessionContext(currentSnap.state).waitingForOthers) {
+      stopReason = 'waiting_for_others';
+      stopDetail = '等待联机队友行动';
+      break;
+    }
+
     // For steps after the first inside combat, verify state settled and didn't diverge.
     if (idx > 0 && isCombatQueue) {
-      const waitRes = await client.waitUntilActionable({ timeoutMs: settleTimeoutMs, pollIntervalMs: 120 });
+      const waitRes = await client.waitUntilActionable({ timeoutMs: settleTimeoutMs, pollIntervalMs });
       currentSnap = waitRes.snapshot;
       if (waitRes.waitingForOthers) {
         stopReason = 'waiting_for_others';
@@ -642,7 +967,7 @@ export async function executeBatch(client, sequenceInput, {
         break;
       }
 
-      const div = detectCombatDivergence(planState, lastPreStepState, currentSnap.state, step, idx, lastExecutedAction);
+      const div = detectCombatDivergence(planState, lastPreStepState, currentSnap.state, step, idx, lastExecutedAction, { retargetMode });
       if (div) {
         stopReason = div.reason;
         stopDetail = div.detail;
@@ -659,7 +984,11 @@ export async function executeBatch(client, sequenceInput, {
 
     let actionBody;
     try {
-      actionBody = resolveActionBody(step, currentSnap.state, reason);
+      actionBody = resolveActionBody(step, currentSnap.state, reason, {
+        planEnemies,
+        retargetMode,
+        retargetedNotes,
+      });
     } catch (err) {
       stopReason = err instanceof Sts2ApiError ? err.code : 'invalid_step';
       stopDetail = err.message;
@@ -667,17 +996,94 @@ export async function executeBatch(client, sequenceInput, {
     }
 
     let actionResult;
-    try {
-      actionResult = await client.postAction(actionBody);
-    } catch (err) {
-      stopReason = err instanceof Sts2ApiError ? err.code : 'action_error';
-      stopDetail = err.message;
-      // Re-sync latest state after rejection so caller sees exact live screen
+    let stepAbortedByRetryGuard = false;
+    let transientAttempt = 0;
+    while (true) {
       try {
-        currentSnap = await client.getSnapshot();
-      } catch {
-        // Keep last known snapshot
+        actionResult = await client.postAction(actionBody);
+        break;
+      } catch (err) {
+        const isTransientCode = err instanceof Sts2ApiError && TRANSIENT_POST_CODES.has(err.code);
+        if (isTransientCode && transientAttempt < maxTransientRetries) {
+          let probeSnap = null;
+          try {
+            probeSnap = await client.getSnapshot();
+          } catch {
+            probeSnap = null;
+          }
+
+          if (probeSnap?.state) {
+            currentSnap = probeSnap;
+            const probeCtx = detectSessionContext(probeSnap.state);
+            if (probeCtx.waitingForOthers) {
+              stopReason = 'waiting_for_others';
+              stopDetail = '等待联机队友行动';
+              stepAbortedByRetryGuard = true;
+              break;
+            }
+          }
+
+          const shouldWaitAndRetry = !probeSnap?.state
+            || err.code !== 'invalid_action'
+            || isTransientReadinessBlock(probeSnap.state)
+            || isStepLegalInSnapshot(step, probeSnap.state, {
+              planState,
+              preStepState: lastPreStepState,
+              stepIndex: idx,
+              lastAction: lastExecutedAction,
+              retargetMode,
+            });
+
+          if (shouldWaitAndRetry) {
+            transientAttempt += 1;
+            const waitRetry = await client.waitUntilActionable({ timeoutMs: settleTimeoutMs, pollIntervalMs });
+            currentSnap = waitRetry.snapshot;
+            if (waitRetry.waitingForOthers) {
+              stopReason = 'waiting_for_others';
+              stopDetail = '等待联机队友行动';
+              stepAbortedByRetryGuard = true;
+              break;
+            }
+            if (isCombatQueue) {
+              const div = detectCombatDivergence(planState, lastPreStepState, currentSnap.state, step, idx, lastExecutedAction, { retargetMode });
+              if (div) {
+                stopReason = div.reason;
+                stopDetail = div.detail;
+                stepAbortedByRetryGuard = true;
+                break;
+              }
+            }
+            if (waitRetry.actionable) {
+              try {
+                actionBody = resolveActionBody(step, currentSnap.state, reason, {
+                  planEnemies,
+                  retargetMode,
+                  retargetedNotes,
+                });
+                continue;
+              } catch (resolveErr) {
+                stopReason = resolveErr instanceof Sts2ApiError ? resolveErr.code : 'invalid_step';
+                stopDetail = resolveErr.message;
+                stepAbortedByRetryGuard = true;
+                break;
+              }
+            }
+          }
+        }
+
+        stopReason = err instanceof Sts2ApiError ? err.code : 'action_error';
+        stopDetail = err.message;
+        try {
+          currentSnap = await client.getSnapshot();
+        } catch {
+          // Keep last known snapshot
+        }
+        stepAbortedByRetryGuard = true;
+        break;
       }
+    }
+
+    if (stepAbortedByRetryGuard) {
       break;
     }
 
@@ -705,14 +1111,12 @@ export async function executeBatch(client, sequenceInput, {
 
     // Refresh snapshot after executing step
     if (idx < boundSteps.length - 1) {
-      // Wait for next step inside loop
       currentSnap = {
         state: actionResult?.state || (await client.getSnapshot()).state,
         available_actions: actionResult?.state?.available_actions || [],
       };
     } else {
-      // Last step in queue: wait briefly for game animations/turn transition to settle before reporting!
-      const waitEnd = await client.waitUntilActionable({ timeoutMs: settleTimeoutMs, pollIntervalMs: 140 });
+      const waitEnd = await client.waitUntilActionable({ timeoutMs: settleTimeoutMs, pollIntervalMs });
       currentSnap = waitEnd.snapshot;
     }
   }
@@ -722,7 +1126,7 @@ export async function executeBatch(client, sequenceInput, {
   if (mode === 'auto' && (stopReason === 'completed' || stopReason === 'screen_changed')) {
     const rewardHistory = new Set();
     for (let k = 0; k < maxAutoAdvance; k += 1) {
-      const waitRes = await client.waitUntilActionable({ timeoutMs: settleTimeoutMs, pollIntervalMs: 140 });
+      const waitRes = await client.waitUntilActionable({ timeoutMs: settleTimeoutMs, pollIntervalMs });
       currentSnap = waitRes.snapshot;
       if (waitRes.waitingForOthers || !waitRes.actionable) break;
 
@@ -742,12 +1146,25 @@ export async function executeBatch(client, sequenceInput, {
         break;
       }
     }
-    const finalWait = await client.waitUntilActionable({ timeoutMs: 2500, pollIntervalMs: 140 });
+    const finalWait = await client.waitUntilActionable({ timeoutMs: 2500, pollIntervalMs });
     currentSnap = finalWait.snapshot;
+  }
+
+  // Optimization 4: if --wait is enabled and we ended in multiplayer waiting_for_others, block via SSE until next turn is ready
+  if (waitForTurn && detectSessionContext(currentSnap.state).waitingForOthers) {
+    const turnWait = await client.waitForTurnReady({ timeoutMs: waitTimeoutMs });
+    if (turnWait.snapshot) currentSnap = turnWait.snapshot;
+    waitVia = turnWait.via;
+    if (turnWait.ready && stopReason === 'waiting_for_others') {
+      stopReason = 'completed';
+      stopDetail = null;
+    }
   }
 
   const bannerParts = [`[执行结果] 已执行 ${executed.length}/${boundSteps.length} 步 | 停止原因:${stopReason}`];
   if (stopDetail) bannerParts.push(stopDetail);
+  if (retargetedNotes.length > 0) bannerParts.push(retargetedNotes.join(', '));
+  if (waitVia) bannerParts.push(`等回合:${waitVia}`);
   if (autoAdvanced.length > 0) {
     bannerParts.push(`自动过场:${autoAdvanced.map((a) => a.label).join(' -> ')}`);
   }
@@ -765,6 +1182,8 @@ export async function executeBatch(client, sequenceInput, {
     stopReason,
     stopDetail,
     autoAdvanced,
+    retargeted: retargetedNotes,
+    waitVia,
     stateText,
     finalState: currentSnap.state,
   };

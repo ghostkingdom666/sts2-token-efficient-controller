@@ -40,8 +40,11 @@ function printHelp() {
   node sts2.js observe [--mode assist|auto|coop] [--full] [--instance ...]
       只读获取当前极简战报与确定性数值算术（军师/辅助模式）
 
-  node sts2.js act "<动作序列>" [--mode auto|assist|coop] [--reason "<理由>"] [--full]
-      执行整回合动作队列（支持自动过场与抽牌/变数智能中断），返回下一决策点战报
+  node sts2.js wait [--mode coop|auto|assist] [--timeout <秒>] [--full] [--instance ...]
+      多人联机零Token等待：通过 SSE 事件流静默阻塞至队友出完牌、轮到我方行动，再返回战报
+
+  node sts2.js act "<动作序列>" [--mode auto|assist|coop] [--reason "<理由>"] [--retarget safe|off|any] [--no-retarget] [--wait] [--wait-timeout <秒>] [--full]
+      执行整回合动作队列（支持瞬态就绪等待、队友击杀顺位映射、无反伤/非特殊机制怪安全自动转火），返回下一决策点战报
       动作示例:
         "play 0 0; play 2; end"     打出0号牌打0号怪 -> 打2号牌 -> 结束回合
         "play cid:12 0; potion 0 0" 按稳定 cid 打牌 + 用药水
@@ -126,6 +129,27 @@ async function runObserve(client, flags) {
   console.log(output);
 }
 
+async function runWait(client, flags) {
+  const mode = String(flags.mode || 'coop').toLowerCase();
+  const full = Boolean(flags.full);
+  const timeoutSec = Number(flags.timeout);
+  const timeoutMs = Number.isFinite(timeoutSec) && timeoutSec > 0 ? timeoutSec * 1000 : 120_000;
+  const res = await client.waitForTurnReady({ timeoutMs });
+  const snap = res.snapshot || await client.getSnapshot();
+  const seenCache = new SeenCache(path.join(CACHE_DIR, 'seen_cache.json'));
+  const banner = res.ready
+    ? `[等待完成] 通道:${res.via} | 轮到我方行动`
+    : `[等待超时] 已等待 ${Math.round(timeoutMs / 1000)}s，队友仍在行动中`;
+  const output = compressState(snap.state, {
+    availableActions: snap.available_actions,
+    mode,
+    full,
+    seenCache,
+    extraBanner: banner,
+  });
+  console.log(output);
+}
+
 async function runAct(client, args, flags) {
   const seq = args.join(' ').trim();
   if (!seq) {
@@ -134,6 +158,17 @@ async function runAct(client, args, flags) {
   const mode = String(flags.mode || 'auto').toLowerCase();
   const full = Boolean(flags.full);
   const reason = typeof flags.reason === 'string' ? flags.reason : null;
+  const retarget = flags['no-retarget']
+    ? 'off'
+    : String(flags.retarget || 'safe').toLowerCase();
+  if (!['safe', 'off', 'any'].includes(retarget)) {
+    throw new Error(`无效的 --retarget 参数 "${retarget}"，可选值为 safe / off / any`);
+  }
+  const waitForTurn = Boolean(flags.wait);
+  const waitTimeoutSec = Number(flags['wait-timeout'] ?? flags.timeout);
+  const waitTimeoutMs = Number.isFinite(waitTimeoutSec) && waitTimeoutSec > 0
+    ? waitTimeoutSec * 1000
+    : 120_000;
   const seenCache = new SeenCache(path.join(CACHE_DIR, 'seen_cache.json'));
 
   const result = await executeBatch(client, seq, {
@@ -141,6 +176,9 @@ async function runAct(client, args, flags) {
     reason,
     full,
     seenCache,
+    retarget,
+    waitForTurn,
+    waitTimeoutMs,
   });
   console.log(result.stateText);
 }
@@ -191,6 +229,9 @@ async function main() {
       break;
     case 'observe':
       await runObserve(client, flags);
+      break;
+    case 'wait':
+      await runWait(client, flags);
       break;
     case 'act':
       await runAct(client, args, flags);

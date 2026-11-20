@@ -14,9 +14,10 @@
    - **按局增量词条去重 (`.cache/seen_cache.json`)**：同一局 (`run_id`) 内首次出现的卡牌、遗物、Buff 与术语附带规则说明；后续回合自动隐藏重复说明书，只保留名称、费用、层数与实时伤害预览，大幅削减上下文体积。
    - **确定性战斗算术预计算**：由本地 JS 代码直接算好 `[来袭总伤 | 护甲缺口 | 最大可叠甲 | 手牌直伤上限 | 斩杀线提示]`，省去大模型反复心算消耗的 Thinking Tokens，同时杜绝算错斩杀或护甲缺口。
    - **整回合批处理 + 无分支自动过场 (`src/batch_runner.js`)**：AI 可一次发送整回合序列（例如 `play 0 0; play 2; end`）；对无分支弹窗、战利品金币收取、单一道路移动、已完成事件翻页等自动推进（**0 Token 过场**）。
-3. **手牌移位保护与变数智能中断**
+3. **手牌移位保护、联机零干扰与安全自动转火**
    - 出牌队列在执行前会将手牌下标自动绑定到游戏内稳定的 `combat_card_id` (`cid`)，打出一张牌导致手牌左移也不会错打后续卡牌。
-   - 一旦连招中途触发**抽牌/衍生牌 (`new_cards`)、选牌弹窗 (`pending_choice`)、敌人意图变化 (`intent_changed`)、掉血 (`took_damage`) 或目标死亡 (`target_gone`)**，立即安全中断队列并返回最新战报让 AI 重新规划。
+   - **联机队友同步容错**：自动等待队友出牌产生的 200ms 状态稳定窗（并本地重试瞬态拒绝，避免整轮返回 AI 重算）；队友击杀前排怪引起敌人顺位左移时，自动按位置重映射目标，防御牌与后续对幸存怪的攻击继续执行。
+   - **安全自动转火（默认开启 `--retarget safe`）**：目标怪被队友打死时，对出牌动作仅允许自动转火到**无反伤/荆棘、分裂、狂怒、蜷缩、沉睡、无实体等特殊机制**的常规敌人；药水绝不自动转火，遇特殊机制怪或触发抽牌 (`new_cards`)、选牌弹窗 (`pending_choice`)、意图改变 (`intent_changed`)、掉血 (`took_damage`) 时仍立即中断。
 4. **多人联机 100% 零冲突 (`affects_gameplay: false`)**
    - 根据游戏程序集 `ModManager.GetGameplayRelevantModNameList` 的机制，联机大厅只校验 `"affects_gameplay": true` 的模组。
    - 通信 Mod 清单中声明了 `"affects_gameplay": false`，属于纯客户端辅助工具：**你和朋友 Steam 联机时不会触发 Mod 版本/列表不一致报错，你的朋友也完全不需要安装任何东西！**
@@ -114,17 +115,22 @@ node sts2.js health [--instance human|companion|<pid>] [--url <http://127.0.0.1:
 # 2. 只读观察当前精简战报（军师模式常用，不执行任何点击）
 node sts2.js observe [--mode assist|auto|coop] [--full]
 
-# 3. 执行单步或整回合连招队列，返回下一决策点战报
-node sts2.js act "<动作序列>" [--mode auto|assist|coop] [--reason "<简短理由>"] [--full]
+# 3. 联机零 Token 等待：通过 SSE 事件流阻塞至队友出完牌、轮到我方行动
+node sts2.js wait [--mode coop|auto|assist] [--timeout <秒>] [--full]
 
-# 4. 按需查询图鉴（支持卡牌升级前后对比、遗物、怪物、药水、事件、状态）
+# 4. 执行单步或整回合连招队列，返回下一决策点战报
+node sts2.js act "<动作序列>" [--mode auto|assist|coop] [--reason "<简短理由>"] [--retarget safe|off|any] [--no-retarget] [--wait] [--wait-timeout <秒>] [--full]
+
+# 5. 按需查询图鉴（支持卡牌升级前后对比、遗物、怪物、药水、事件、状态）
 node sts2.js lookup "<关键词>" [--type all|cards|relics|monsters|potions|events|powers|characters] [--refresh]
 
-# 5. 清理本地词条去重缓存与图鉴缓存
+# 6. 清理本地词条去重缓存与图鉴缓存
 node sts2.js cache clear
 ```
 
 > 💡 参数说明：
+> - `--retarget safe|off|any`（默认 `safe`）/ `--no-retarget`：控制多人联机下预设攻击目标被队友击杀时的行为；`safe` 仅在剩余敌人无反伤/无特殊机制时自动转火，`off` 或 `--no-retarget` 严格中断，`any` 允许无视机制转火。
+> - `--wait` / `--wait-timeout <秒>`：在 `act` 执行队列中（如 `end` 后进入联机等待队友状态）使用 SSE 阻塞等待下回合可操作后再返回，减少中间轮询交互。
 > - `--full`：临时跳过按局词条去重，完整显示当前界面所有卡牌/遗物/Buff 的规则描述。
 > - `--instance companion`：当使用 Mod 内置的本地双开“邀请 AI 队友”功能时，可直接接管操作副窗口队友角色。
 
