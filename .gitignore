@@ -1,3 +1,7 @@
 .cache/
 vendor/
 node_modules/
+
+# 本地视频宣传片工程与故事线方案（约 220 MB，不上传）
+video/
+STORYLINES.md
